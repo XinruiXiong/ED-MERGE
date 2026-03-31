@@ -270,7 +270,7 @@ class MultiModalModel(nn.Module):
 
 
 # -------------------------
-# Feature order from UMN train.pkl
+# Feature order from UMN training data
 # -------------------------
 def feature_order_from_train_pkl(train_df: pd.DataFrame, train_outcome_cols):
     base_like = {"stay_id", "subject_id", "is_repeat", "NOTE_TEXT", "note_text"}

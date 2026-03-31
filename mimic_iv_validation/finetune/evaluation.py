@@ -84,7 +84,7 @@ def parse_args():
 
 
 # =========================
-# Dataset & Collate (match your original logic)
+# Dataset & Collate 
 # =========================
 class MultiModalDataset(Dataset):
     def __init__(self, df: pd.DataFrame, outcome_cols, tabular_cols, use_text=True):
@@ -341,7 +341,7 @@ class MultiModalModel(nn.Module):
 
 
 # =========================
-# Feature order from UMN train.pkl (strict)
+# Feature order from UMN training data
 # =========================
 def feature_order_from_train_pkl(train_df: pd.DataFrame, train_outcome_cols):
     base_like = {"stay_id", "subject_id", "is_repeat", "NOTE_TEXT", "note_text"}
