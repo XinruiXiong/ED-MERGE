@@ -200,19 +200,27 @@ def _max_index_from_prefix(state_dict, prefix):
     return mx
 
 
-def _build_sequential_from_state(state_dict, prefix):
+def _build_seq_with_fills(state_dict, prefix, dropout_p=0.1):
     """
-    Build nn.Sequential with indices 0..max_idx.
-    - if weight exists and is 2D -> Linear
-    - if weight exists and is 1D -> BatchNorm1d
-    - else -> Identity (fill)
-    This guarantees keys like f"{prefix}{i}.weight" exist where needed.
+    Reconstruct an nn.Sequential from checkpoint keys matching prefix.
+
+    Parameterized positions are rebuilt from the weight shape:
+      - 2D weight -> Linear
+      - 1D weight -> BatchNorm1d
+
+    Non-parameterized positions (ReLU, Dropout) have no checkpoint keys and
+    are filled in order: first gap -> ReLU, second gap -> Dropout(dropout_p),
+    subsequent gaps -> Identity. This matches the training architecture of both
+    tabular_encoder and fusion_classifier exactly.
+
+    Returns None when no matching keys are found (triggering the caller's fallback).
     """
     max_idx = _max_index_from_prefix(state_dict, prefix)
     if max_idx < 0:
         return None
 
     mods = []
+    last_fill = None
     for i in range(max_idx + 1):
         w_key = f"{prefix}{i}.weight"
         if w_key in state_dict:
@@ -224,8 +232,17 @@ def _build_sequential_from_state(state_dict, prefix):
                 mods.append(nn.BatchNorm1d(int(w.shape[0])))
             else:
                 mods.append(nn.Identity())
+            last_fill = None
         else:
-            mods.append(nn.Identity())
+            if last_fill is None:
+                mods.append(nn.ReLU())
+                last_fill = "relu"
+            elif last_fill == "relu":
+                mods.append(nn.Dropout(p=float(dropout_p)))
+                last_fill = "drop"
+            else:
+                mods.append(nn.Identity())
+                last_fill = None
     return nn.Sequential(*mods)
 
 
@@ -236,10 +253,12 @@ class MultiTaskBertAttentionPool(nn.Module):
         hidden = int(self.encoder.config.hidden_size)
         self.max_notes_per_fwd_pass = max(1, int(max_notes_per_fwd_pass))
 
-        # build attention_project and attention_context exactly by keys
-        self.attention_project = _build_sequential_from_state(state_dict, "text_encoder.attention_project.")
+        # attention_project: _build_seq_with_fills returns None here because
+        # _max_index_from_prefix extracts parts[1] which is "attention_project"
+        # (not an integer) for keys like "text_encoder.attention_project.0.weight".
+        # The fallback builds the correct Sequential(Linear, Tanh) directly.
+        self.attention_project = _build_seq_with_fills(state_dict, "text_encoder.attention_project.")
         if self.attention_project is None:
-            # fallback (shouldn't happen for your ckpt)
             self.attention_project = nn.Sequential(nn.Linear(hidden, hidden), nn.Tanh())
 
         # attention_context param
@@ -297,12 +316,11 @@ class MultiModalModel(nn.Module):
             fusion_in += text_hidden
 
         if self.use_tabular:
-            self.tabular_encoder = _build_sequential_from_state(state_dict, "tabular_encoder.")
+            self.tabular_encoder = _build_seq_with_fills(state_dict, "tabular_encoder.", dropout_p=0.2)
             if self.tabular_encoder is None:
                 self.tabular_encoder = nn.Identity()
                 tab_out = int(num_tabular_features)
             else:
-                # last Linear out dim if any
                 tab_out = None
                 max_idx = _max_index_from_prefix(state_dict, "tabular_encoder.")
                 for i in range(max_idx, -1, -1):
@@ -313,7 +331,7 @@ class MultiModalModel(nn.Module):
                 tab_out = int(num_tabular_features) if tab_out is None else int(tab_out)
             fusion_in += tab_out
 
-        self.fusion_classifier = _build_sequential_from_state(state_dict, "fusion_classifier.")
+        self.fusion_classifier = _build_seq_with_fills(state_dict, "fusion_classifier.", dropout_p=0.1)
         if self.fusion_classifier is None:
             self.fusion_classifier = nn.Sequential(nn.Linear(fusion_in, num_labels))
 
@@ -499,6 +517,13 @@ def finetune_loop(model, train_loader, val_loader, outcome_cols, device, fp16, a
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
+
+        # Apply remaining accumulated gradients if the last mini-batch did not
+        # land on a gradient accumulation boundary.
+        if len(train_loader) % args.grad_accum != 0:
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
 
         train_loss = total / max(1, steps)
 
