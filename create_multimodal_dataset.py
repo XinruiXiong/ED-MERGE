@@ -19,8 +19,8 @@ from sklearn.preprocessing import StandardScaler
 OUTCOME_COLS_LIST = [
     'outcome_ed_revisit_3d', 'outcome_hospitalization', 'outcome_critical',
     'outcome_sepsis', 'outcome_copd_exac', 'outcome_acs_mi', 'outcome_stroke',
-    'outcome_ards', 'outcome_aki', 'outcome_bac_pne', 'outcome_viral_pne',
-    'outcome_all_pne', 'outcome_asthma_exac', 'outcome_ahf', 'outcome_copd_asthma', 'outcome_pe'
+    'outcome_ards', 'outcome_aki', 'outcome_all_pne',
+    'outcome_asthma_exac', 'outcome_ahf', 'outcome_copd_asthma', 'outcome_pe'
 ]
 
 # =========================
