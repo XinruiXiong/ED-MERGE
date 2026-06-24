@@ -1,69 +1,38 @@
 # ED-MERGE
 
-**ED-MERGE** is a dynamic multimodal framework for early Emergency Department (ED) risk stratification using strictly post-arrival EHR data.
+**ED-MERGE** is a dynamic multimodal framework for early risk stratification in the Emergency Department (ED), integrating unstructured clinical notes, dynamic vital signs, and static structured patient features through a dual-encoder fusion architecture. Risk estimates are updated continuously as new information accrues during the ED visit, with strict prevention of look-ahead bias at every observation window.
 
-The framework integrates:
+This repository contains the full implementation accompanying the manuscript:
 
-- Unstructured clinical notes
-- Dynamic physiological measurements
-- Static structured patient features
-
-through a dual-encoder fusion architecture to generate continuously updated risk trajectories across multiple ED outcomes.
+> *ED-MERGE: A Dynamic Multimodal Framework for Early Risk Stratification in the Emergency Department with External Validation*
+> Xinrui Xiong, Xinnie Mai, et al. — University of Minnesota
 
 <p align="center">
   <img src="figures/framework_overview.png" width="100%">
 </p>
 
-Key features:
-
-- Dynamic rolling-horizon risk inference
-- BioClinicalBERT-based clinical text modeling
-- Multimodal fusion of text + vitals + static features
-- Multi-outcome prediction framework
-- Internal UMN-ED evaluation and external MIMIC-IV-ED validation
-- Integrated Gradients text interpretation
-
-**ED-MERGE** is a multimodal Emergency Department (ED) risk prediction pipeline for time-aware, multi-outcome clinical prediction. The project integrates unstructured clinical notes, dynamic vital signs, and static structured patient information to predict multiple ED-relevant outcomes across different post-arrival observation windows.
-
-The repository includes scripts for multimodal dataset construction, model training, single-modality ablation experiments, text attribution analysis using Integrated Gradients, and external validation on MIMIC-IV-ED with and without site-specific fine-tuning.
-
----
-
-## Pipeline Overview
-
-```text
-Raw EHR Streams
-    ├── Clinical Notes
-    ├── Vital Signs
-    └── Static Patient Features
-            ↓
-Temporal Window Construction
-            ↓
-Multimodal Dataset Generation
-            ↓
-BioClinicalBERT + Structured Encoder
-            ↓
-Multimodal Fusion
-            ↓
-Dynamic Multi-Outcome Risk Prediction
-            ↓
-External Validation + Interpretation
-```
-
-All predictions are generated using cumulative post-arrival data available up to the specified ED observation window, with strict prevention of look-ahead bias.
-
 ---
 
 ## Overview
 
-ED-MERGE is designed to support early ED risk stratification by using all available patient information up to a specified time window after ED arrival. For each encounter, the pipeline constructs a cumulative representation of the patient state using:
+ED-MERGE predicts 14 clinical outcomes simultaneously from data available within the first 6 hours of ED arrival. At any observation time T, the model processes all information documented before T, with the effective cutoff capped at `min(intime + T, dx_time)` to prevent diagnosis-time leakage.
 
-- **Clinical notes** available before the observation cutoff
-- **Vital signs** recorded before the observation cutoff
-- **Static structured patient information**, including comorbidity and chief complaint features
-- **Multi-task outcome labels** for ED revisit, hospitalization, critical outcomes, sepsis, cardiopulmonary events, pneumonia, asthma/COPD exacerbations, acute heart failure, pulmonary embolism, and related diagnoses
+**Predicted outcomes (14 total)**
 
-The central modeling framework uses BioClinicalBERT for text encoding, an MLP encoder for structured features, and a fusion classifier for multi-label prediction.
+| Category | Outcomes |
+|---|---|
+| Acute syndromes | Sepsis, ACS/MI, Stroke, AHF, AKI, ARDS, PE, COPD exacerbation, Asthma exacerbation, COPD+Asthma |
+| Infectious | Pneumonia (all-cause) |
+| Utilization | Hospitalization, Critical outcome, 3-day ED revisit |
+
+*Critical outcome* is defined as in-hospital mortality or ICU transfer within 12 hours.
+
+**Key results (internal UMN cohort, 60-min window)**
+- Macro AUROC: 0.928 (95% CI, 0.927–0.929)
+- Macro AUPRC: 0.382 (95% CI, 0.379–0.384)
+
+**External validation (BIDMC / MIMIC-IV-ED, zero recalibration)**
+- Macro AUROC: 0.855 (95% CI, 0.853–0.856)
 
 ---
 
@@ -71,225 +40,174 @@ The central modeling framework uses BioClinicalBERT for text encoding, an MLP en
 
 ```text
 ED-MERGE/
-├── README.md
 ├── create_multimodal_dataset.py     # temporal multimodal dataset construction
 ├── create_multimodal_dataset.sh
-├── extract_stay_ids.py              # positive-case extraction for interpretation
-├── extract_stay_ids.sh
-├── train_multimodal.py              # main multimodal training pipeline
+├── train_multimodal.py              # main multimodal model training
 ├── train_multimodal.sh
 ├── single_modal.py                  # single-modality ablation experiments
 ├── single_modal.sh
+├── extract_stay_ids.py              # positive case sampling for interpretation
+├── extract_stay_ids.sh
 ├── ig_text.py                       # Integrated Gradients text attribution
 ├── ig_text.sh
-└── mimic_iv_validation/
-├── README.md
-├── create_multimodal_dataset.py
-├── create_multimodal_dataset.sh
-├── extract_stay_ids.py
-├── extract_stay_ids.sh
-├── train_multimodal.py
-├── train_multimodal.sh
-├── single_modal.py
-├── single_modal.sh
-├── ig_text.py
-├── ig_text.sh
+├── figures/
+│   └── framework_overview.png
 └── mimic_iv_validation/
     ├── non-finetune/
-    │   ├── preprocess.py
+    │   ├── preprocess.py            # MIMIC feature alignment to UMN space
     │   ├── preprocess.sh
-    │   ├── evaluation.py
+    │   ├── evaluation.py            # zero-recalibration external evaluation
     │   └── evaluation.sh
     └── finetune/
         ├── preprocess.py
         ├── preprocess.sh
-        ├── evaluation.py
+        ├── evaluation.py            # site-adapted fine-tuning evaluation
         └── evaluation.sh
 ```
 
 ---
 
-## Core Pipeline
+## Model Architecture
 
-### 1. Multimodal Dataset Construction
+ED-MERGE uses a three-component fusion architecture:
 
-`create_multimodal_dataset.py` builds the model-ready datasets from the internal ED cohort.
+1. **Clinical Text Encoder** — BioClinicalBERT encodes each note independently via sliding-window tokenization (512-token chunks, 128-token stride). Note-level `[CLS]` embeddings are aggregated into a single encounter representation using a trainable attention pooling layer.
 
-Inputs include:
+2. **Tabular Encoder** — An MLP maps static structured features (age, Charlson/Elixhauser comorbidities, chief complaint indicators) and dynamic vital signs (the most recent measurement within window T) into a 128-dimensional embedding: `Linear(F,256) → BN → ReLU → Dropout(0.2) → Linear(256,128)`.
 
-- A master encounter-level parquet file
-- A directory of clinical note parquet files
-- A vital-sign file
-- Outcome columns and structured features contained in the master dataset
+3. **Fusion Classifier** — Text and tabular embeddings are concatenated (768+128=896 dimensions) and passed through a shared hidden layer: `Linear(896,512) → BN → ReLU → Dropout(0.1) → Linear(512,14)`. Fourteen independent sigmoid outputs produce multi-label predictions.
 
-The script performs:
+Training uses Focal Loss (α=0.25, γ=2.0) with AdamW. Differential learning rates are applied: BERT encoder at 2e-5, all other parameters at 1e-3.
 
-- ID cleaning for `subject_id` and `stay_id`
-- Temporal train/test split by encounter year
-- Subject-level train/validation split within the training pool
-- Time-window filtering for notes and vitals
-- Optional diagnosis-time boundary logic using `dx_time`
-- Vital-sign aggregation into final window-level features
-- Static structured feature extraction
-- Train-only standardization of tabular features
-- Output of `train.pkl`, `val.pkl`, `test.pkl`, and `scaler.pkl`
+---
 
-The observation cutoff is defined as:
+## Pipeline
 
-```text
-effective_end = min(intime + time_window, dx_time)
-```
+### Step 1 — Dataset Construction
 
-when `dx_time` is available. Otherwise, the cutoff is `intime + time_window`.
+`create_multimodal_dataset.py` builds model-ready train/val/test pickle files from the internal UMN ED cohort.
 
-Example run:
+The script:
+- Splits encounters chronologically: ≤2022 for development, ≥2023 for testing
+- Performs subject-level 90/10 train/validation split within the development pool
+- Filters notes and vitals to within `effective_end = min(intime + window, dx_time)`
+- Builds `final_*` vital features as the most recent within-window measurement, falling back to triage values
+- Fits a `StandardScaler` on training data only; applies to val and test
+- Outputs `train.pkl`, `val.pkl`, `test.pkl`, and `scaler.pkl`
 
 ```bash
 python create_multimodal_dataset.py \
-  --master_parquet /path/to/master_dataset_clean.parquet \
-  --notes_dir /path/to/notes_all_parts \
+  --master_parquet /path/to/master_dataset.parquet \
+  --notes_dir /path/to/notes_parts/ \
   --notes_stay_col SERVICE_ID \
   --notes_time_col FILING_DATE \
   --notes_text_col NOTE_TEXT \
-  --vitals_file /path/to/VITALS_SUBSET.tsv \
-  --output_dir /path/to/preprocessed_6h \
-  --time_window 6h \
+  --vitals_file /path/to/vitals.tsv \
+  --output_dir /path/to/preprocessed_1h \
+  --time_window 1h \
   --train_year_le 2022 \
   --test_year_ge 2023 \
   --val_ratio 0.1 \
   --seed 42
 ```
 
+Repeat with different `--time_window` values (e.g., `t0`, `30min`, `1h`, `2h`, `6h`) to generate datasets for each evaluation window.
+
 ---
 
-### 2. Multimodal Model Training
+### Step 2 — Multimodal Training
 
-`train_multimodal.py` trains the main multimodal model.
-
-The model contains three major components:
-
-1. **Text encoder**
-   - BioClinicalBERT encodes each note independently.
-   - Multiple notes from the same encounter are aggregated using attention pooling over note-level `[CLS]` embeddings.
-
-2. **Tabular encoder**
-   - Structured features are passed through an MLP.
-   - These features include dynamic vital signs and static patient profile variables.
-
-3. **Fusion classifier**
-   - Text and tabular embeddings are concatenated.
-   - A shared classifier predicts all outcomes as a multi-label task.
-
-The model is trained with Focal Loss to address class imbalance.
-
-Example run:
+`train_multimodal.py` trains the full multimodal model on the preprocessed dataset.
 
 ```bash
 python train_multimodal.py \
-  --preprocessed_dir /path/to/preprocessed_6h \
-  --bert_dir /utilities/models/Bio_ClinicalBERT \
-  --output_dir /path/to/multimodal_model_output_6h \
+  --preprocessed_dir /path/to/preprocessed_1h \
+  --bert_dir /path/to/Bio_ClinicalBERT \
+  --output_dir /path/to/model_output_1h \
   --epochs 4 \
-  --max_notes 100 \
   --batch_size 8 \
-  --grad_acc 4
+  --grad_acc 4 \
+  --max_notes 100 \
+  --doc_stride 128 \
+  --max_windows_per_sample 200
 ```
 
-Main outputs include:
+The best checkpoint is selected by validation macro AUPRC. Per-outcome F1-maximizing thresholds are computed from the validation set and saved alongside the checkpoint.
 
+Outputs:
 ```text
-best_model.pt
+best_model.pt           # model weights + outcome_cols + tabular_cols + thresholds + tokenization config
 best_thresholds.json
-metrics.json
-logits.npy
-labels.npy
-text_embeddings.npy
-structured_embeddings.npy
-fused_embeddings.npy
+test_metrics.json
+test_text_embeddings.npy
+test_tabular_embeddings.npy
+test_fused_embeddings.npy
+test_labels.npy
+test_stay_ids.txt
 ```
 
 ---
 
-### 3. Single-Modality and Ablation Experiments
+### Step 3 — Single-Modality Ablations
 
-`single_modal.py` supports modality-specific ablation experiments using the same modeling framework.
+`single_modal.py` supports modality-specific ablation experiments under the same architecture and training procedure.
 
-Supported modes:
-
-```text
-multimodal
-text_only
-vitals_only
-profile_only
-```
-
-These experiments are used to quantify the contribution of each modality to ED risk prediction.
-
-Example run:
+| Mode | Features used |
+|---|---|
+| `multimodal` | Text + vitals + static structured |
+| `text_only` | Text only (no tabular input) |
+| `vitals_only` | Dynamic vital signs only (`final_*` columns) |
+| `profile_only` | Static structured only (comorbidities + chief complaint + age) |
 
 ```bash
 python single_modal.py \
-  --preprocessed_dir /path/to/preprocessed_t0 \
-  --bert_dir /utilities/models/Bio_ClinicalBERT \
-  --output_dir /path/to/profile_only_t0 \
+  --preprocessed_dir /path/to/preprocessed_1h \
+  --bert_dir /path/to/Bio_ClinicalBERT \
+  --output_dir /path/to/ablation_text_only_1h \
+  --mode text_only \
   --epochs 4 \
-  --mode profile_only \
   --batch_size 8
 ```
 
 ---
 
-### 4. Positive Case Sampling
+### Step 4 — Positive Case Sampling
 
-`extract_stay_ids.py` samples positive encounters from `test.pkl` for a selected outcome. This is useful for case-level interpretation and visualization.
-
-Example run:
+`extract_stay_ids.py` samples positive encounters from `test.pkl` for a given outcome. Used to select cases for interpretation.
 
 ```bash
 python extract_stay_ids.py \
-  --preprocessed_dir /path/to/preprocessed_0.5h \
-  --outcome_col outcome_all_pne \
+  --preprocessed_dir /path/to/preprocessed_1h \
+  --outcome_col outcome_sepsis \
   --n 50 \
-  --seed 123 \
-  --out_txt pos_stayids_all_pne.txt \
-  --out_csv pos_stayids_all_pne.csv
+  --seed 42 \
+  --out_txt pos_stay_ids.txt \
+  --out_csv pos_stay_ids.csv
 ```
 
 ---
 
-### 5. Text Attribution with Integrated Gradients
+### Step 5 — Text Attribution
 
-`ig_text.py` performs text-only Integrated Gradients attribution for a trained multimodal checkpoint.
+`ig_text.py` computes Integrated Gradients (IG) attribution over the text embedding space for a single encounter, using a trained multimodal checkpoint.
 
-The script:
-
-- Loads a trained `best_model.pt`
-- Selects a single encounter by `stay_id`
-- Selects a prediction target by outcome name or index
-- Keeps the tabular branch fixed as a constant baseline
-- Computes token-level and sentence-level text attribution
-- Produces sentence attribution tables, plots, and HTML note highlights
-
-Example run:
+The tabular branch is held fixed at its zero-baseline during attribution. IG is computed over `inputs_embeds`, not token IDs, covering up to the first 512 tokens of each note (sliding window not applied during attribution).
 
 ```bash
 python ig_text.py \
-  --preprocessed_dir /path/to/preprocessed_0.5h \
+  --preprocessed_dir /path/to/preprocessed_1h \
   --ckpt /path/to/best_model.pt \
-  --bert_dir /utilities/models/Bio_ClinicalBERT \
+  --bert_dir /path/to/Bio_ClinicalBERT \
   --split test \
-  --stay_id 49320935798 \
-  --label outcome_all_pne \
-  --max_length 512 \
-  --note_chunk_size 32 \
+  --stay_id 12345678 \
+  --label outcome_sepsis \
   --steps 50 \
   --baseline mask \
   --top_k 15 \
-  --out_dir /path/to/ig_all_pne
+  --out_dir /path/to/ig_output
 ```
 
-Outputs include:
-
+Outputs:
 ```text
 sentence_ig.csv
 sentence_ig_topk.png
@@ -301,37 +219,23 @@ run_summary.json
 
 ## External Validation on MIMIC-IV-ED
 
-The `mimic_iv_validation/` directory contains scripts for external validation on MIMIC-IV-ED. Two settings are supported:
+External validation uses the independent BIDMC cohort from MIMIC-IV-ED. The UMN-trained model is applied directly without site-specific recalibration or threshold adjustment, providing a strict assessment of cross-institutional transportability.
 
-1. **Non-finetune external validation**
-2. **Fine-tuned external validation**
-
-Both settings first preprocess the MIMIC data to match the UMN-trained feature space.
-
----
+MIMIC-IV data is available at [PhysioNet](https://physionet.org) (requires credentialed access):
+- MIMIC-IV v1.0
+- MIMIC-IV-ED v1.0
+- MIMIC-IV-Note v2.2
 
 ### MIMIC Preprocessing
 
-The MIMIC preprocessing scripts convert a MIMIC CSV file into model-ready pickle files aligned with the UMN feature order.
-
-The preprocessing step:
-
-- Converts the MIMIC text column to `note_text`
-- Wraps each note as a list of strings
-- Maps MIMIC triage vitals to the internal `final_*` feature format
-- Preserves outcome columns beginning with `outcome_`
-- Recovers the tabular feature order from the UMN `train.pkl`
-- Applies the UMN-fitted scaler to MIMIC tabular features
-- Splits MIMIC encounters into train/validation/test sets by `stay_id`
-
-Example run:
+Both validation settings share the same preprocessing step. The script aligns MIMIC features to the UMN training feature space using the UMN `train.pkl` column order and `scaler.pkl`.
 
 ```bash
-python preprocess.py \
-  --mimic_csv /path/to/master_dataset_with_notes_mimic.csv \
-  --umn_scaler_path /path/to/umn/scaler.pkl \
-  --umn_train_pkl_path /path/to/umn/train.pkl \
-  --output_dir /path/to/mimic_iv_validation/splits \
+python mimic_iv_validation/non-finetune/preprocess.py \
+  --mimic_csv /path/to/mimic_with_notes.csv \
+  --umn_scaler_path /path/to/scaler.pkl \
+  --umn_train_pkl_path /path/to/train.pkl \
+  --output_dir /path/to/mimic_splits \
   --prefix mimic_external \
   --seed 42 \
   --train_ratio 0.8 \
@@ -339,79 +243,37 @@ python preprocess.py \
   --test_ratio 0.1
 ```
 
-Generated files:
-
-```text
-mimic_external_train.pkl
-mimic_external_val.pkl
-mimic_external_test.pkl
-```
-
 ---
 
-### Non-Finetune External Validation
+### Zero-Recalibration Evaluation (primary)
 
-The non-finetune setting directly evaluates a UMN-trained checkpoint on MIMIC-IV-ED without updating model parameters.
-
-This setting is intended to measure direct cross-site generalization.
-
-The script:
-
-- Loads the UMN-trained `best_model.pt`
-- Loads UMN thresholds when available
-- Aligns MIMIC features to the UMN training feature order
-- Concatenates MIMIC train/validation/test splits into one external evaluation set
-- Evaluates AUROC, AUPRC, and F1 for each outcome and macro average
-
-Example run:
+Evaluates the UMN-trained checkpoint on the full MIMIC cohort without updating any model parameters or thresholds. This is the setting reported in the paper.
 
 ```bash
-python evaluation.py \
-  --ckpt_path /path/to/umn/best_model.pt \
-  --thresholds_path /path/to/umn/best_thresholds.json \
+python mimic_iv_validation/non-finetune/evaluation.py \
+  --ckpt_path /path/to/best_model.pt \
+  --thresholds_path /path/to/best_thresholds.json \
   --train_pkl /path/to/mimic_external_train.pkl \
   --val_pkl /path/to/mimic_external_val.pkl \
   --test_pkl /path/to/mimic_external_test.pkl \
-  --umn_train_pkl_path /path/to/umn/train.pkl \
-  --bert_dir /utilities/models/Bio_ClinicalBERT \
+  --umn_train_pkl_path /path/to/train.pkl \
+  --bert_dir /path/to/Bio_ClinicalBERT \
   --mode multimodal \
   --batch_size 32 \
-  --max_notes 100 \
-  --note_chunk_size 32 \
   --out_dir /path/to/non_finetune_eval
-```
-
-Outputs:
-
-```text
-metrics.json
-logits.npy
-labels.npy
 ```
 
 ---
 
-### Fine-Tuned External Validation
+### Fine-Tuned Evaluation (exploratory)
 
-The fine-tune setting initializes from the UMN-trained checkpoint, adapts the model on MIMIC training data, optionally selects the best state on MIMIC validation data, and evaluates on held-out MIMIC test data.
-
-This setting is intended to measure domain adaptation performance after site-specific fine-tuning.
-
-The script supports:
-
-- Full multimodal fine-tuning
-- Text-only, vitals-only, and profile-only fine-tuning
-- Optional text encoder freezing with `--freeze_text_encoder`
-- Focal Loss for imbalanced multi-label training
-- Saving the fine-tuned checkpoint
-
-Example run:
+Initializes from the UMN checkpoint and adapts the model on MIMIC training data before evaluating on held-out MIMIC test data. This is an exploratory setting not used for the paper's reported external validation results.
 
 ```bash
-python evaluation.py \
-  --ckpt_path /path/to/umn/best_model.pt \
-  --bert_dir /utilities/models/Bio_ClinicalBERT \
-  --umn_train_pkl_path /path/to/umn/train.pkl \
+python mimic_iv_validation/finetune/evaluation.py \
+  --ckpt_path /path/to/best_model.pt \
+  --bert_dir /path/to/Bio_ClinicalBERT \
+  --umn_train_pkl_path /path/to/train.pkl \
   --train_pkl /path/to/mimic_external_train.pkl \
   --val_pkl /path/to/mimic_external_val.pkl \
   --test_pkl /path/to/mimic_external_test.pkl \
@@ -421,45 +283,8 @@ python evaluation.py \
   --lr 1e-5 \
   --batch_size 16 \
   --freeze_text_encoder \
-  --save_finetuned_ckpt /path/to/finetuned_on_mimic.pt \
   --out_dir /path/to/mimic_finetune_eval
 ```
-
-Outputs:
-
-```text
-metrics.json
-test_logits.npy
-test_labels.npy
-finetuned_on_mimic.pt
-```
-
----
-
-## Prediction Targets
-
-The internal pipeline supports the following outcome columns:
-
-```text
-outcome_ed_revisit_3d
-outcome_hospitalization
-outcome_critical
-outcome_sepsis
-outcome_copd_exac
-outcome_acs_mi
-outcome_stroke
-outcome_ards
-outcome_aki
-outcome_bac_pne
-outcome_viral_pne
-outcome_all_pne
-outcome_asthma_exac
-outcome_ahf
-outcome_copd_asthma
-outcome_pe
-```
-
-The exact outcome set used during training is stored in each checkpoint as `outcome_cols` and is reused during evaluation.
 
 ---
 
@@ -467,143 +292,82 @@ The exact outcome set used during training is stored in each checkpoint as `outc
 
 ### Internal UMN Data
 
-The internal preprocessing script expects:
-
-- Encounter-level master parquet file
-- Note parquet directory
-- Vital-sign file
-
-Required encounter-level fields include:
-
-```text
-subject_id
-stay_id
-intime
-dx_time
+**Master parquet** (encounter level):
+```
+subject_id, stay_id, intime, dx_time, age,
+cci_*, eci_*, chiefcom_*,
+triage_temperature, triage_heartrate, triage_resprate,
+triage_o2sat, triage_sbp, triage_dbp,
 outcome_*
 ```
 
-Notes should contain:
-
-```text
-stay_id or SERVICE_ID
-filing_date or FILING_DATE
-note_text or NOTE_TEXT
+**Notes parquet directory** (one or more parquet files):
+```
+stay_id / SERVICE_ID
+filing_date / FILING_DATE    (final signature timestamp)
+note_text / NOTE_TEXT
 ```
 
-Vitals should contain:
-
-```text
-SERVICE_ID
-DISPLAY_NAME
-RECORDED_DATETIME
-VALUE_ORIG
+**Vitals TSV**:
 ```
+SERVICE_ID, DISPLAY_NAME, RECORDED_DATETIME, VALUE_ORIG
+```
+`DISPLAY_NAME` values: `Temp`, `Heart Rate`, `Resp`, `SpO2`, `BP (SYSTOLIC)`, `BP (DIASTOLIC)`
 
 ### MIMIC-IV-ED Data
 
-The MIMIC preprocessing script expects a CSV file containing:
-
-```text
+```
 stay_id
-admission_note_text or note_text or NOTE_TEXT
+admission_note_text / note_text / NOTE_TEXT
+triage_temperature, triage_heartrate, triage_resprate,
+triage_o2sat, triage_sbp, triage_dbp
+cci_*, eci_*
 outcome_*
-triage_temperature
-triage_heartrate
-triage_resprate
-triage_o2sat
-triage_sbp
-triage_dbp
-cci_*
-eci_*
 ```
 
-Missing UMN-aligned features are filled with zeros before scaling.
+Missing UMN-aligned features are zero-filled before scaling.
+
+---
+
+## Data Availability
+
+**UMN cohort**: Not publicly available due to HIPAA and institutional policy. De-identified subsets may be requested for academic replication purposes via the corresponding author, subject to IRB approval and a Data Use Agreement.
+
+**MIMIC-IV / BIDMC cohort**: Publicly available on PhysioNet after completing CITI training and obtaining credentialed access:
+- [MIMIC-IV v1.0](https://physionet.org/content/mimiciv/1.0/)
+- [MIMIC-IV-ED v1.0](https://physionet.org/content/mimic-iv-ed/1.0/)
+- [MIMIC-IV-Note v2.2](https://physionet.org/content/mimic-iv-note/2.2/)
 
 ---
 
 ## Environment
 
-The provided `.sh` scripts are written for a Slurm-based GPU cluster using Apptainer.
-
-Typical execution environment:
-
 ```text
 Python 3.11
 PyTorch
-Transformers
+Transformers (HuggingFace)
 scikit-learn
 pandas
 numpy
 tqdm
-Captum
+captum
 matplotlib
-BioClinicalBERT local checkpoint
 ```
 
-The scripts assume a local BioClinicalBERT directory such as:
-
-```text
-/utilities/models/Bio_ClinicalBERT
-```
-
-Example Slurm execution:
-
-```bash
-sbatch train_multimodal.sh
-```
+The scripts assume a local BioClinicalBERT checkpoint directory. The `.sh` files are configured for a Slurm cluster using Apptainer and can be submitted with `sbatch`.
 
 ---
 
-## Outputs and Metrics
+## Reproducibility
 
-The training and evaluation scripts report:
-
-- AUROC
-- AUPRC
-- F1 score using validation-selected or loaded thresholds
-- Macro-average metrics across available outcomes
-- Per-outcome metrics
-
-Saved outputs commonly include:
-
-```text
-metrics.json
-best_model.pt
-best_thresholds.json
-logits.npy
-labels.npy
-text_embeddings.npy
-tabular_embeddings.npy
-fused_embeddings.npy
-```
-
----
-
-## Notes on Reproducibility
-
-- Random seeds are exposed through command-line arguments.
-- Internal train/test split is based on encounter year.
-- Internal validation split is subject-level to reduce leakage.
-- MIMIC train/validation/test split is performed by `stay_id`.
-- Tabular standardization is fit on the internal training data and reused for external validation.
-- The checkpoint stores the outcome column order used during training.
-
----
-
-## Project Status
-
-This repository currently contains the implementation for:
-
-- Internal multimodal ED prediction
-- Temporal observation-window dataset construction
-- Single-modality ablations
-- Integrated Gradients text attribution
-- MIMIC-IV-ED external validation without fine-tuning
-- MIMIC-IV-ED external validation with fine-tuning
+- All random seeds are configurable via `--seed`
+- Train/test split is chronological (year-based), not random
+- Train/validation split is subject-level to prevent patient-level leakage
+- The scaler is fit on training data only and reused for val, test, and external validation
+- Each checkpoint stores `outcome_cols`, `tabular_cols`, and tokenization parameters (`max_length`, `doc_stride`, `max_notes`, `max_windows_per_sample`) to ensure consistent inference
 
 ---
 
 ## Contact
 
-For questions about this repository, please contact through xion3020@umn.edu
+For questions about this repository, please contact xion3020@umn.edu
