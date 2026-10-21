@@ -1,2 +1,22 @@
 ._*
+.DS_Store
+__pycache__/
+*.pyc
+
+# manuscript files
 *.docx
+*.pdf
+Method_draft.md
+Results_draft.html
+results_collected.md
+
+# PhysioNet credentialed data (DUA: must not be redistributed)
+physionet.org/
+discharge.csv
+*.csv.gz
+
+# separate repository
+ED-Agent/
+
+# internal design log (local only)
+ARCHITECTURE.md
