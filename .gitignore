@@ -9,6 +9,9 @@ __pycache__/
 Method_draft.md
 Results_draft.html
 results_collected.md
+Discussion_draft.html
+*.pptx
+AMIA_figs/
 
 # PhysioNet credentialed data (DUA: must not be redistributed)
 physionet.org/

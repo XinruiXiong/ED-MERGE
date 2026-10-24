@@ -2,6 +2,8 @@
 
 Dynamic multimodal risk prediction in the emergency department. Each ED encounter is represented as one continuous stream of time-stamped events — static features, vital-sign and laboratory updates, and signed clinical notes — and a single GRU model estimates the risk of 16 outcomes at any time after arrival from the events recorded up to that time.
 
+![ED-MERGE overview](figures/fig1_overview.png)
+
 ## Layout
 
 ```
@@ -64,6 +66,20 @@ python phase1_model/precompute_note_embeddings.py --event_dir MIMIC_EVENTS --spl
 python external_validation/evaluate_external.py --event_dir MIMIC_EVENTS \
   --embed_cache_dir MIMIC_NOTE_CACHE --ckpt_path MODEL/best_model.pt --out_dir EXT_EVAL
 ```
+
+## Results
+
+**Internal temporal test** (245,247 encounters, new patients 2023–2025): macro AUROC 0.874 at arrival → 0.957 at 6 h.
+
+![Internal performance](figures/fig2_internal_performance.png)
+
+**External validation** (MIMIC-IV, 155,379 admitted ED stays, 12 outcomes, no retraining): macro AUROC 0.849 → 0.867.
+
+![External validation](figures/fig3_external_validation.png)
+
+**Case-level risk trajectories** with per-input contributions.
+
+![Case trajectories](figures/fig4_case_trajectories.png)
 
 ## Notes
 

@@ -7,6 +7,10 @@ Two modes:
   --mode candidates   rank true-positive encounters of --outcome that start
                       below threshold at arrival and cross it later, from the
                       existing landmark_encounter_detail.parquet (no model run).
+                      Ranked by the number of steps up across the landmark grid,
+                      then total rise; encounters with a large drop, or whose
+                      notes name the outcome diagnosis (DX_TERMS) within the
+                      observation window, are excluded.
                       Prints a de-identified summary (case rank, no stay_id);
                       the stay_id mapping is written to case_candidates_<outcome>.csv.
   --mode trace        one encounter (--case_rank from that csv, or --stay_id):
@@ -17,7 +21,7 @@ Two modes:
                            p_full - p_without_<component> (same inference-time
                            removal as evaluate_ablation.py)
                       Notes are shown by time / type / author role only; note
-                      text is never read.
+                      text is never printed.
 
 Output under --out_dir:
   case_candidates_<outcome>.csv
@@ -47,6 +51,24 @@ MODALITY_CONFIGS = {
     "without_structured": ("vital", "lab"),
     "without_static": ("static",),
 }
+# Outcome-diagnosis terms for the candidate screen: an encounter is excluded if
+# any note within its observation window matches. Deliberately broad (history
+# mentions also match) -- false exclusions only cost candidates.
+DX_TERMS = {
+    "sepsis": r"sepsis|septic|\bsirs\b|A41\.",
+    "acs_mi": r"stemi|\bacs\b|myocardial infarction|acute coronary|\bmi\b|I21\.",
+    "ahf": r"heart failure|\bchf\b|\bhfref\b|\bhfpef\b|cardiogenic|I50\.",
+    "pe": r"pulmonary embol|\bpe\b|I26\.",
+    "stroke": r"stroke|\bcva\b|cerebrovascular accident|I63\.",
+    "aki": r"acute kidney injury|\baki\b|acute renal failure|N17\.",
+    "ards": r"\bards\b|respiratory distress syndrome",
+    "copd_exac": r"copd|aecopd",
+    "asthma_exac": r"asthma",
+    "copd_asthma": r"copd|asthma",
+    "all_pne": r"pneumonia|\bpna\b",
+    "bac_pne": r"pneumonia|\bpna\b",
+    "viral_pne": r"pneumonia|\bpna\b",
+}
 SHORT = {"temperature": "Temp", "heartrate": "HR", "resprate": "RR", "o2sat": "SpO2", "sbp": "SBP", "dbp": "DBP"}
 
 
@@ -62,7 +84,17 @@ def parse_args():
     ap.add_argument("--detail", help="landmark_encounter_detail.parquet (candidates mode)")
     ap.add_argument("--min_boundary", type=float, default=120, help="min observation boundary, minutes")
     ap.add_argument("--min_notes", type=int, default=2)
+    ap.add_argument("--min_struct", type=int, default=1,
+                    help="min structured (vital/lab) events by the last landmark; 1 = triage seed only")
     ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--min_steps", type=int, default=3,
+                    help="min landmark-to-landmark increases of >= --step_min")
+    ap.add_argument("--step_min", type=float, default=0.03)
+    ap.add_argument("--max_drop", type=float, default=0.05, help="largest allowed landmark-to-landmark decrease")
+    ap.add_argument("--notes_events", help="{split}_notes_events.parquet for the diagnosis check "
+                                           "(default: under --event_dir)")
+    ap.add_argument("--dx_pool", type=int, default=300, help="top-N by shape that get the diagnosis check")
+    ap.add_argument("--allow_dx", action="store_true", help="keep encounters whose notes name the diagnosis")
     # trace
     ap.add_argument("--embed_cache_dir", help="note embedding cache (trace mode)")
     ap.add_argument("--case_rank", type=int)
@@ -95,6 +127,25 @@ def positives(row, outcome_cols):
 
 # --------------------------------------------------------------------------- candidates
 
+def load_dx_flags(a, col, stays, upper):
+    """Per stay: earliest minute (<= its observation upper bound) at which a note
+    names the outcome diagnosis, NaN if none. Note text is scanned, never printed."""
+    pattern = DX_TERMS.get(col.replace("outcome_", ""))
+    if pattern is None:
+        return pd.Series(np.nan, index=stays)
+    path = a.notes_events or os.path.join(a.event_dir, f"{a.split}_notes_events.parquet")
+    cols = ["stay_id", "t_minutes", "note_text"]
+    try:
+        n = pd.read_parquet(path, columns=cols, filters=[("stay_id", "in", list(stays))])
+    except Exception:
+        n = pd.read_parquet(path, columns=cols)
+    n["stay_id"] = n["stay_id"].astype(str)
+    n = n[n["stay_id"].isin(set(stays))]
+    n = n[n["t_minutes"] <= n["stay_id"].map(upper)]
+    hit = n["note_text"].fillna("").str.contains(pattern, case=False, regex=True)
+    return n[hit].groupby("stay_id")["t_minutes"].min().reindex(stays)
+
+
 def run_candidates(a, col, thr, outcome_cols, static_df, static_scaler):
     det = pd.read_parquet(a.detail, columns=["landmark_minutes", "stay_id", "n_notes_seen", "n_vitals_seen",
                                              f"{col}_prob", f"{col}_label"])
@@ -102,6 +153,7 @@ def run_candidates(a, col, thr, outcome_cols, static_df, static_scaler):
     det["stay_id"] = det["stay_id"].astype(str)
     p = det.pivot(index="stay_id", columns="landmark_minutes", values=f"{col}_prob")
     p.columns = [int(round(c)) for c in p.columns]
+    grid = sorted(p.columns)
     last = det.sort_values("landmark_minutes").groupby("stay_id").last()
 
     st = static_df.set_index(static_df["stay_id"].astype(str))
@@ -110,24 +162,47 @@ def run_candidates(a, col, thr, outcome_cols, static_df, static_scaler):
         "n_notes": last["n_notes_seen"], "n_struct": last["n_vitals_seen"],
     })
     cand["boundary"] = st.loc[cand.index, "data_boundary_minutes"]
-    cand = cand[(cand["p0"] < thr) & (cand["p_last"] >= thr)
-                & (cand["boundary"].fillna(np.inf) >= a.min_boundary) & (cand["n_notes"] >= a.min_notes)]
-    # first grid landmark at which risk crosses the threshold
-    grid = sorted(p.columns)
-    cand["cross_min"] = [next((T for T in grid if p.at[s, T] >= thr), np.nan) for s in cand.index]
+    bins = pd.cut(cand["n_struct"], [0, 1, 2, 5, 10, np.inf], labels=["1", "2", "3-5", "6-10", ">10"])
+    print(f"\n#### {col}: all true positives by structured events seen at last landmark (n={len(cand):,})")
+    print(bins.value_counts().sort_index().to_string())
+
+    # trajectory shape on the landmark grid: steps up (>= --step_min) and the largest drop
+    diffs = p[grid].diff(axis=1).iloc[:, 1:]
+    cand["steps_up"] = (diffs >= a.step_min).sum(axis=1)
+    cand["max_drop"] = (-diffs).clip(lower=0).max(axis=1)
     cand["rise"] = cand["p_last"] - cand["p0"]
-    cand = cand.sort_values("rise", ascending=False).head(a.top).reset_index().rename(columns={"index": "stay_id"})
+    cand = cand[(cand["p0"] < thr) & (cand["p_last"] >= thr)
+                & (cand["boundary"].fillna(np.inf) >= a.min_boundary) & (cand["n_notes"] >= a.min_notes)
+                & (cand["n_struct"] >= a.min_struct)
+                & (cand["steps_up"] >= a.min_steps) & (cand["max_drop"] <= a.max_drop)]
+    cand["cross_min"] = [next((T for T in grid if p.at[s, T] >= thr), np.nan) for s in cand.index]
+    cand = cand.sort_values(["steps_up", "rise"], ascending=False)
+
+    # drop encounters whose notes name the diagnosis within the observation window
+    pool = cand.head(a.dx_pool)
+    upper = {s: landmark_upper_bound(b, cfg.MAX_LANDMARK_MINUTES_DEFAULT) for s, b in pool["boundary"].items()}
+    pool = pool.assign(first_dx_min=load_dx_flags(a, col, list(pool.index), upper))
+    n_dx = int(pool["first_dx_min"].notna().sum())
+    if not a.allow_dx:
+        pool = pool[pool["first_dx_min"].isna()]
+    cand = pool.head(a.top).reset_index().rename(columns={"index": "stay_id"})
     cand.insert(0, "case_rank", np.arange(1, len(cand) + 1))
     cand.to_csv(os.path.join(a.out_dir, f"case_candidates_{col.replace('outcome_', '')}.csv"), index=False)
 
-    print(f"\n#### candidates: {col}  threshold={thr:.3f}  (true positives, p0<thr, crosses later)")
+    print(f"\n#### candidates: {col}  threshold={thr:.3f}  (true positives, p0<thr, crosses later, "
+          f">= {a.min_steps} steps up of >= {a.step_min}, no drop > {a.max_drop})")
+    print(f"     diagnosis named in notes: {n_dx} of the top {a.dx_pool} by shape"
+          + ("" if a.allow_dx else " -- excluded"))
     for _, r in cand.iterrows():
         row = st.loc[r["stay_id"]]
         age, cc, _ = describe_static(row, static_scaler)
-        traj = "  ".join(f"{T}:{p.at[r['stay_id'], T]:.2f}" for T in SHOW_LANDMARKS if T in p.columns)
+        traj = " ".join(f"{p.at[r['stay_id'], T]:.2f}" for T in grid)
         b = "none" if pd.isna(r["boundary"]) else f"{r['boundary']:.0f}"
-        print(f"[{int(r['case_rank']):>2}] age {age:.0f}  ESI {row.get('triage_acuity', 'NA')}  boundary {b} min  "
-              f"notes {int(r['n_notes'])}  struct {int(r['n_struct'])}  cross@{r['cross_min']:.0f}  | {traj}")
+        dx = "dx-free" if pd.isna(r["first_dx_min"]) else f"dx@{r['first_dx_min']:.0f}"
+        print(f"[{int(r['case_rank']):>2}] age {age:.0f}  ESI {row.get('triage_acuity', 'NA')}  boundary {b}  "
+              f"notes {int(r['n_notes'])}  struct {int(r['n_struct'])}  steps {int(r['steps_up'])}  "
+              f"cross@{r['cross_min']:.0f}  {dx}")
+        print(f"      risk at {'/'.join(str(T) for T in grid)} min: {traj}")
         print(f"      cc: {', '.join(cc) or '-'}   positive: {', '.join(positives(row, outcome_cols))}")
 
 
