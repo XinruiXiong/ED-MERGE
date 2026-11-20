@@ -1,6 +1,7 @@
 # ED-MERGE
 
 Dynamic multimodal risk prediction in the emergency department. Each ED encounter is represented as one continuous stream of time-stamped events — static features, vital-sign and laboratory updates, and signed clinical notes — and a single GRU model estimates the risk of 16 outcomes at any time after arrival from the events recorded up to that time.
+Read our preprint here: [ED-MERGE Preprint (PDF)](https://assets-eu.researchsquare.com/files/rs-10020548/v1_covered_c6717053-f654-4ee8-9fe4-56b1f5c63714.pdf?c=1789472385)
 
 ![ED-MERGE overview](figures/fig1_overview.png)
 
