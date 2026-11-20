@@ -78,6 +78,10 @@ def parse_args():
                     help="best_thresholds.json from training; if given, F1 is also reported")
     ap.add_argument("--n_boot", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--revisit_discharged", action="store_true",
+                    help="evaluate outcome_ed_revisit_3d in discharged "
+                         "encounters only (no hospitalization, no "
+                         "critical outcome)")
     ap.add_argument("--out_dir", required=True)
     return ap.parse_args()
 
@@ -85,10 +89,22 @@ def parse_args():
 def main():
     a = parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    d = pd.read_parquet(a.detail)
+    if a.detail.endswith(".csv"):
+        d = pd.read_csv(a.detail, dtype={"stay_id": str})
+    else:
+        d = pd.read_parquet(a.detail)
     d["stay_id"] = d["stay_id"].astype(str)
-    st = pd.read_parquet(a.static, columns=["stay_id", "subject_id"])
-    subj = st.assign(stay_id=st["stay_id"].astype(str)).set_index("stay_id")["subject_id"].astype(str)
+    cols = ["stay_id", "subject_id"]
+    if a.revisit_discharged:
+        cols += ["outcome_hospitalization", "outcome_critical"]
+    st = pd.read_parquet(a.static, columns=cols)
+    st["stay_id"] = st["stay_id"].astype(str)
+    subj = st.set_index("stay_id")["subject_id"].astype(str)
+    discharged = set()
+    if a.revisit_discharged:
+        keep = ((st["outcome_hospitalization"] == 0)
+                & (st["outcome_critical"] == 0))
+        discharged = set(st.loc[keep, "stay_id"])
     outcomes = [c[:-5] for c in d.columns if c.endswith("_prob")]
     thresholds = json.load(open(a.thresholds)) if a.thresholds else {}
     metrics = ["AUROC", "AUPRC"] + (["F1"] if thresholds else [])
@@ -99,16 +115,24 @@ def main():
         g = g.reset_index(drop=True)
         codes, uniq = pd.factorize(g["stay_id"].map(subj).fillna(g["stay_id"]))
         n_pat = len(uniq)
-        sorted_by = {o: SortedScores(g[f"{o}_prob"].to_numpy(np.float64), g[f"{o}_label"].to_numpy())
-                     for o in outcomes}
+        all_rows = np.ones(len(g), dtype=bool)
+        masks = {o: all_rows for o in outcomes}
+        if a.revisit_discharged and "outcome_ed_revisit_3d" in outcomes:
+            masks["outcome_ed_revisit_3d"] = g["stay_id"].isin(
+                discharged).to_numpy()
+        sorted_by = {o: SortedScores(
+            g.loc[masks[o], f"{o}_prob"].to_numpy(np.float64),
+            g.loc[masks[o], f"{o}_label"].to_numpy())
+            for o in outcomes}
 
         def evaluate(w):
             out = {}
             for o, ss in sorted_by.items():
-                auroc, ap = ss.auroc_ap(w)
+                auroc, ap = ss.auroc_ap(w[masks[o]])
                 out[(o, "AUROC")], out[(o, "AUPRC")] = auroc, ap
                 if thresholds:
-                    out[(o, "F1")] = ss.f1(w, thresholds.get(o, 0.5))
+                    out[(o, "F1")] = ss.f1(w[masks[o]],
+                                           thresholds.get(o, 0.5))
             for m in metrics:
                 vals = [out[(o, m)] for o in outcomes]
                 out[("macro", m)] = np.nanmean(vals) if not np.all(np.isnan(vals)) else np.nan

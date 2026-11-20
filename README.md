@@ -28,6 +28,8 @@ Run everything from the repository root. Data are not included.
 | 6 | `phase1_model/evaluate_ablation.py` | component ablation (inference-time removal) |
 | 7 | `phase1_model/bootstrap_ci.py` | patient-level bootstrap 95% CIs |
 | 8 | `phase1_model/case_trajectories.py` | single-encounter risk trajectories |
+| 9 | `phase1_model/baselines.py`, `baselines_lr.py` | arrival-time baselines (modified NEWS, logistic regression) vs ED-MERGE |
+| 10 | `phase1_model/lead_time.py`, `plot_lead_time.py` | sepsis alert lead time vs work-up orders |
 
 ```bash
 python phase0_data/build_event_streams.py \
@@ -43,7 +45,17 @@ python phase1_model/evaluate_landmarks.py --event_dir EVENTS --embed_cache_dir N
 python phase1_model/evaluate_ablation.py --event_dir EVENTS --embed_cache_dir NOTE_CACHE \
   --ckpt_path MODEL/best_model.pt --split test --configs full only_static only_text only_structured --out_dir ABL
 python phase1_model/bootstrap_ci.py --detail EVAL/landmark_encounter_detail.parquet \
-  --static EVENTS/test_static.parquet --out_dir CI
+  --static EVENTS/test_static.parquet --revisit_discharged --out_dir CI
+
+python phase1_model/baselines.py --event_dir EVENTS --master MASTER \
+  --detail EVAL/landmark_encounter_detail.parquet --out_dir BASE
+python phase1_model/baselines_lr.py --event_dir EVENTS --master MASTER \
+  --pred BASE/baseline_predictions.parquet --out_dir BASE/lr
+
+python phase1_model/lead_time.py --event_dir EVENTS --embed_cache_dir NOTE_CACHE \
+  --ckpt_path MODEL/best_model.pt --orders ORDERS --master MASTER \
+  --detail EVAL/landmark_encounter_detail.parquet --out_dir LEAD
+python phase1_model/plot_lead_time.py --cases LEAD/lead_time_cases.csv --out LEAD/figS4_lead_time.png
 ```
 
 ## External validation (MIMIC-IV)
